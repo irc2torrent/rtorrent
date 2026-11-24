@@ -122,7 +122,10 @@ log_vmmap_dump(const std::string& str) {
     fprintf(log_file, "%8p-%8p [%5llxk]\n", all_mapping.ptr, (char*)all_mapping.ptr + all_mapping.length, (long long unsigned int)(all_mapping.length / 1024));
   }
 
-  fclose(log_file);
+  // The buffered output only reaches the kernel here.
+  if (fclose(log_file) != 0)
+    throw torrent::input_error("Could not write log file: " + str);
+
   return torrent::Object();
 }
 
@@ -135,7 +138,7 @@ initialize_command_logging() {
   CMD2_ANY_LIST    ("log.open_gz_file_pid",   std::bind(&apply_log_open, log_flag_append_pid | log_flag_use_gz, std::placeholders::_2));
   CMD2_ANY_LIST    ("log.append_file",        std::bind(&apply_log_open, log_flag_append_file, std::placeholders::_2));
   CMD2_ANY_LIST    ("log.append_file.flush",  std::bind(&apply_log_open, log_flag_append_file | log_flag_flush, std::placeholders::_2));
-  CMD2_ANY_LIST    ("log.append_gz_file",     std::bind(&apply_log_open, log_flag_append_file, std::placeholders::_2));
+  CMD2_ANY_LIST    ("log.append_gz_file",     std::bind(&apply_log_open, log_flag_append_file | log_flag_use_gz, std::placeholders::_2));
 
   CMD2_ANY_STRING_V("log.close",            std::bind(&torrent::log_close_output_str, std::placeholders::_2));
 

@@ -6,6 +6,7 @@
 #include <functional>
 #include <torrent/exceptions.h>
 
+#include "core/download.h"
 #include "globals.h"
 #include "rpc/parse.h"
 #include "rpc/parse_commands.h"
@@ -19,6 +20,19 @@ inline bool command_map_is_space(char c) {
 
 inline bool command_map_is_newline(char c) {
   return c == '\n' || c == '\0' || c == ';';
+}
+
+// A command may erase the download it was called on, which must then not be
+// passed to the commands after it. The check throws once that happened.
+static std::function<void()>
+erased_download_check(target_type target) {
+  if (target.first != command_base::target_download)
+    return [] {};
+
+  return [lifetime = static_cast<core::Download*>(target.second)->lifetime()] {
+    if (lifetime.expired())
+      throw torrent::input_error("The download was erased by an earlier command.");
+  };
 }
 
 // Only escape eol on odd number of escape characters. We know that
@@ -90,8 +104,11 @@ parse_command_type
 parse_command(target_type target, const char* first, const char* last) {
   first = std::find_if(first, last, [&](char c) { return !command_map_is_space(c); });
 
-  if (first == last || *first == '#')
-    return std::make_pair(torrent::Object(), first);
+  // A comment runs to the end of its line, return where the next command starts.
+  if (first == last || *first == '#') {
+    first = std::find_if(first, last, &command_map_is_newline);
+    return std::make_pair(torrent::Object(), first != last ? first + 1 : first);
+  }
 
   char key[128];
 
@@ -124,15 +141,54 @@ parse_command(target_type target, const char* first, const char* last) {
 }
 
 torrent::Object
-parse_command_multiple(target_type target, const char* first, const char* last) {
+parse_command_object(const char* first, const char* last) {
+  first = std::find_if(first, last, [&](char c) { return !command_map_is_space(c); });
+
+  if (first == last || *first == '#')
+    return torrent::Object();
+
+  char key[128];
+
+  first = parse_command_name(first, last, key, key + 128);
+  first = std::find_if(first, last, [&](char c) { return !command_map_is_space(c); });
+
+  if (first == last || *first != '=')
+    throw torrent::input_error("Could not find '=' in command '" + std::string(key) + "'.");
+
+  torrent::Object result = torrent::Object::create_dict_key();
+
+  result.as_dict_key() = key;
+
+  first = parse_whole_list(first + 1, last, &result.as_dict_obj(), &parse_is_delim_command);
+
+  // Find the last character that is part of this command, skipping
+  // the whitespace at the end.
+  first = std::find_if(first, last, [&](char c) { return !command_map_is_space(c); });
+
+  // This helper accepts exactly one command and cannot return where a next
+  // command begins, so reject every non-whitespace suffix, including ';'.
+  if (first != last && *first != '\0')
+    throw torrent::input_error("Junk at end of input.");
+
+  return result;
+}
+
+torrent::Object
+parse_command_multiple(target_type target, const char* first, const char* last, const std::function<void()>& after_each) {
   parse_command_type result;
+  auto               throw_if_erased = erased_download_check(target);
 
   while (first != last) {
+    throw_if_erased();
+
     // Should we check the return value? Probably not necessary as
     // parse_args throws on unquoted multi-word input.
     result = parse_command(target, first, last);
 
     first = result.second;
+
+    if (after_each)
+      after_each();
   }
 
   return result.first;
@@ -181,6 +237,11 @@ parse_command_file(const std::string& path) {
       getCount = 0;
     }
 
+    if (file.fail() && !file.eof()) {
+      lineNumber++;
+      throw torrent::input_error("Exceeded max line length.");
+    }
+
   } catch (torrent::input_error& e) {
     snprintf(buffer, 2048, "Error in option file: %s:%u: %s", path.c_str(), lineNumber, e.what());
 
@@ -188,6 +249,25 @@ parse_command_file(const std::string& path) {
   }
 
   return true;
+}
+
+bool
+is_valid_command(const torrent::Object& command) {
+  if (!command.is_string())
+    return false;
+
+  auto first = command.as_string().begin();
+  auto last  = command.as_string().end();
+
+  first = std::find_if(first, last, [](char c) { return !command_map_is_space(c); });
+
+  if (first == last || !std::isalpha(static_cast<unsigned char>(*first)))
+    return false;
+
+  first = std::find_if(first, last, [](unsigned char c) { return !std::isalnum(c) && c != '_' && c != '.'; });
+  first = std::find_if(first, last, [](char c) { return !command_map_is_space(c); });
+
+  return first != last && *first == '=';
 }
 
 torrent::Object
@@ -201,16 +281,23 @@ call_object(const torrent::Object& command, target_type target) {
   case torrent::Object::TYPE_LIST:
   {
     torrent::Object result;
+    auto            throw_if_erased = erased_download_check(target);
 
-    for (const auto& itr : command.as_list())
+    for (const auto& itr : command.as_list()) {
+      throw_if_erased();
       result = call_object(itr, target);
+    }
 
     return result;
   }
   case torrent::Object::TYPE_MAP:
   {
-    for (const auto& itr : command.as_map())
+    auto throw_if_erased = erased_download_check(target);
+
+    for (const auto& itr : command.as_map()) {
+      throw_if_erased();
       call_object(itr.second, target);
+    }
 
     return torrent::Object();
   }

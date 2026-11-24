@@ -17,7 +17,6 @@ libsub_root_a_SOURCES = \
 	core/http_queue.h \
 	core/manager.cc \
 	core/manager.h \
-	core/range_map.h \
 	core/view.cc \
 	core/view.h \
 	core/view_manager.cc \
@@ -171,7 +170,6 @@ libsub_root_a_SOURCES = \
 	utils/functional.h \
 	utils/gzip.cc \
 	utils/gzip.h \
-	utils/list_focus.h \
 	utils/lockfile.cc \
 	utils/lockfile.h \
 	utils/waitpid_queue.cc \
@@ -194,6 +192,8 @@ libsub_root_a_SOURCES = \
 	command_throttle.cc \
 	command_tracker.cc \
 	command_scheduler.cc \
+	command_string.cc \
+	command_system.cc \
 	command_ui.cc \
 	control.cc \
 	control.h \

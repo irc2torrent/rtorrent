@@ -2,7 +2,9 @@
 
 #include <sys/types.h>
 
+#include <cerrno>
 #include <ctime>
+#include <limits>
 #include <regex>
 #include <torrent/utils/log.h>
 
@@ -125,11 +127,20 @@ apply_value([[maybe_unused]] rpc::target_type target, const torrent::Object::lis
   if (args.front().is_value()) {
     val = args.front().as_value();
   } else {
-    int base = args.size() > 1 ? args.back().is_value() ?
-               args.back().as_value() : strtol(args.back().as_string().c_str(), NULL, 10) : 10;
+    int64_t base = args.size() > 1 ? args.back().is_value() ?
+                   args.back().as_value() : strtoll(args.back().as_string().c_str(), NULL, 10) : 10;
+
+    if (base != 0 && (base < 2 || base > 36))
+      throw torrent::input_error("'value' base must be 0 or between 2 and 36!");
+
     char* endptr = 0;
+    errno = 0;
 
     val = strtoll(args.front().as_string().c_str(), &endptr, base);
+
+    if (errno == ERANGE)
+      throw torrent::input_error("Number out of range: " + args.front().as_string());
+
     while (*endptr == ' ' || *endptr == '\n') ++endptr;
     if (*endptr)
       throw torrent::input_error("Junk at end of number: " + args.front().as_string());
@@ -407,8 +418,9 @@ apply_to_time(const torrent::Object& rawArgs, int flags) {
 torrent::Object
 apply_to_elapsed_time(const torrent::Object& rawArgs) {
   auto cached_seconds = torrent::this_thread::cached_seconds().count();
+  auto value          = rawArgs.as_value();
 
-  uint64_t arg = cached_seconds - rawArgs.as_value();
+  uint64_t arg = value >= 0 && value <= cached_seconds ? cached_seconds - value : 0;
 
   char buffer[48];
   snprintf(buffer, 48, "%2d:%02d:%02d", (int)(arg / 3600), (int)((arg / 60) % 60), (int)(arg % 60));
@@ -674,8 +686,13 @@ apply_math_basic(const char* name, Comp op, const torrent::Object::list_type& ar
       throw torrent::input_error(std::string(name) + ": Wrong argument type");
     }
 
-    if (divides && !rhs && itr != args.begin())
-      throw torrent::input_error(std::string(name) + ": Division by zero!");
+    if (divides && itr != args.begin()) {
+      if (rhs == 0)
+        throw torrent::input_error(std::string(name) + ": Division by zero!");
+
+      if (val == std::numeric_limits<int64_t>::min() && rhs == -1)
+        throw torrent::input_error(std::string(name) + ": Division overflow!");
+    }
 
     val = itr == args.begin() ? rhs : op(val, rhs);
 
@@ -916,6 +933,7 @@ initialize_command_ui() {
 
   rpc::rpc.mark_safe("view.set_visible");
   rpc::rpc.mark_safe("view.set_not_visible");
+  rpc::rpc.mark_safe("view.list");
 
   rpc::rpc.mark_safe("cat");
   rpc::rpc.mark_safe("if");

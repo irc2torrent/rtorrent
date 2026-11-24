@@ -53,6 +53,10 @@ public:
   enum RPCType { XML,
                  JSON };
 
+  // A limit below the shortest useful request rejects every request, the one
+  // that would raise it again included.
+  static constexpr uint64_t min_size_limit = 1024;
+
   RpcManager()  = default;
   ~RpcManager() = default;
 
@@ -62,7 +66,7 @@ public:
   void                cleanup();
 
   int64_t             size_limit()                  { return m_xmlrpc.size_limit(); };
-  void                set_size_limit(uint64_t size) { m_xmlrpc.set_size_limit(size); };
+  void                set_size_limit(uint64_t size);
 
   int                 dialect()                     { return m_xmlrpc.dialect(); }
   void                set_dialect(int dialect)      { m_xmlrpc.set_dialect(dialect); }

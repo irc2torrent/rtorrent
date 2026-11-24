@@ -157,7 +157,7 @@ system_method_insert_object(const torrent::Object::list_type& args, int flags) {
     torrent::Object             valueList     = torrent::Object::create_list();
     torrent::Object::list_type& valueListType = valueList.as_list();
 
-    if ((itrArgs)->is_list())
+    if (itrArgs != args.end() && (itrArgs)->is_list())
       valueListType = (itrArgs)->as_list();
 
     control->object_storage()->insert_str(raw_key, valueList, flags);
@@ -394,7 +394,7 @@ cmd_catch(rpc::target_type target, const torrent::Object& args) {
   try {
     return rpc::call_object(args, target);
   } catch (torrent::input_error& e) {
-    lt_log_print(torrent::LOG_WARN, "Caught exception: '%s'.", e.what());
+    lt_log_print(torrent::LOG_ERRORS, "Caught exception: '%s'.", e.what());
     return torrent::Object();
   }
 }

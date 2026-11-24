@@ -68,11 +68,11 @@ apply_dht_add_node(const std::string& arg) {
 torrent::Object
 apply_enable_trackers(int64_t arg) {
   if (arg == 0) {
-    for (auto download : *control->core()->download_list())
+    for (const auto& download : *control->core()->download_list())
       download->tracker_controller().for_each([](auto& tracker) { tracker.disable(); });
 
   } else {
-    for (auto download : *control->core()->download_list())
+    for (const auto& download : *control->core()->download_list())
       download->tracker_controller().for_each([](auto& tracker) { tracker.enable(); });
   }
 
@@ -133,7 +133,7 @@ initialize_command_tracker() {
 
   CMD2_ANY            ("trackers.use_udp",     [](auto, auto) { return true; });
   CMD2_ANY_VALUE_V    ("trackers.use_udp.set", [](auto, auto) {
-      lt_log_print(torrent::LOG_ERROR, "trackers.use_udp.set is no longer supported", 0);
+      lt_log_print(torrent::LOG_ERRORS, "trackers.use_udp.set is no longer supported", 0);
     })
 
   CMD2_ANY_STRING_V   ("dht.mode.set",          [](auto, auto& str) { return control->dht_manager()->set_mode_by_user(str); });
@@ -142,7 +142,7 @@ initialize_command_tracker() {
       lt_log_print(torrent::LOG_DHT_ERROR, "dht.port.set is no longer supported, use dht.override_port.set", 0);
     });
   CMD2_ANY            ("dht.override_port",     [](auto, auto)        { return torrent::runtime::network_config()->override_dht_port(); });
-  CMD2_ANY_VALUE_V    ("dht.override_port.set", [](auto, auto& value) { return torrent::runtime::network_manager()->set_dht_port(value); });
+  CMD2_ANY_VALUE_V    ("dht.override_port.set", [](auto, auto& value) { return torrent::runtime::network_manager()->set_dht_port(checked_port_value(value, "DHT override")); });
 
   CMD2_ANY_STRING     ("dht.add_node",          [](auto, auto& str)   { return apply_dht_add_node(str); });
   CMD2_ANY            ("dht.statistics",        [](auto, auto)        { return control->dht_manager()->dht_statistics(); });

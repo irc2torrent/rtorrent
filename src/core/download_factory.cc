@@ -2,11 +2,13 @@
 
 #include "download_factory.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <torrent/utils/log.h>
 #include <torrent/utils/resume.h>
 #include <torrent/object.h>
@@ -35,8 +37,32 @@ is_network_uri(const std::string& uri) {
     std::strncmp(uri.c_str(), "ftp://", 6) == 0;
 }
 
+static constexpr const char* session_invalid_message = "Session data is invalid, ignoring it";
+
+// A session reload has no load options of its own. Keep the start flag and
+// commands the metadata placeholder was saved with, if they are well formed.
+// A new load always rebuilds the section, so one in the loaded data is never used.
+static bool
+has_meta_download_options(const torrent::Object& root) {
+  if (!root.has_key_map("rtorrent_meta_download"))
+    return false;
+
+  const auto& meta = root.get_key("rtorrent_meta_download");
+
+  if (!meta.has_key_value("start") || !meta.has_key_value("print_log") || !meta.has_key_list("commands"))
+    return false;
+
+  const auto& commands = meta.get_key_list("commands");
+  return std::all_of(commands.begin(), commands.end(), rpc::is_valid_command);
+}
+
 static std::unique_ptr<torrent::Object>
-download_factory_load_stream(const char* filename) {
+download_factory_load_stream(const char* filename, bool* is_invalid) {
+  struct stat sb;
+
+  if (stat(filename, &sb) != 0 || !S_ISREG(sb.st_mode))
+    return std::unique_ptr<torrent::Object>();
+
   std::fstream stream(filename, std::ios::in | std::ios::binary);
 
   if (!stream.is_open())
@@ -45,8 +71,10 @@ download_factory_load_stream(const char* filename) {
   auto obj = std::make_unique<torrent::Object>();
   stream >> *obj;
 
-  if (!stream.good())
+  if (!stream.good() || !obj->is_map()) {
+    *is_invalid = true;
     return std::unique_ptr<torrent::Object>();
+  }
 
   return obj;
 }
@@ -161,8 +189,21 @@ DownloadFactory::receive_commit() {
 
 void
 DownloadFactory::receive_success() {
-  auto rtorrent_object          = download_factory_load_stream((expand_path(m_uri) + ".rtorrent").c_str());
-  auto libtorrent_resume_object = download_factory_load_stream((expand_path(m_uri) + ".libtorrent_resume").c_str());
+  bool session_invalid = false;
+
+  std::unique_ptr<torrent::Object> rtorrent_object;
+  std::unique_ptr<torrent::Object> libtorrent_resume_object;
+
+  if (m_session) {
+    if (m_uri.empty())
+      throw torrent::input_error("Session torrent URI is empty.");
+
+    rtorrent_object          = download_factory_load_stream((expand_path(m_uri) + ".rtorrent").c_str(), &session_invalid);
+    libtorrent_resume_object = download_factory_load_stream((expand_path(m_uri) + ".libtorrent_resume").c_str(), &session_invalid);
+
+    if (session_invalid)
+      lt_log_print(torrent::LOG_ERRORS, "%s: %s", session_invalid_message, m_uri.c_str());
+  }
 
   uint32_t tracker_key;
 
@@ -184,9 +225,17 @@ DownloadFactory::receive_success() {
     return;
   }
 
+  if (session_invalid) {
+    download->set_hash_failed(true);
+    download->set_message(session_invalid_message);
+
+    if (m_printLog)
+      m_manager->push_log_std(std::string(session_invalid_message) + ": \"" + m_uri + "\"");
+  }
+
   torrent::Object* root = download->bencode();
 
-  if (download->download()->info()->is_meta_download()) {
+  if (download->download()->info()->is_meta_download() && !(m_session && has_meta_download_options(*root))) {
     torrent::Object& meta = root->insert_key("rtorrent_meta_download", torrent::Object::create_map());
     meta.insert_key("start", m_start);
     meta.insert_key("print_log", m_printLog);
@@ -247,12 +296,21 @@ DownloadFactory::receive_success() {
 
   // Check first if we already have these values set in the session
   // torrent, so that it is safe to change the values.
-  //
-  // Need to also catch the exceptions.
-  if (rpc::call_command_value("system.file.split_size") >= 0)
-    torrent::file_split_all(download->download()->file_list(),
-                            rpc::call_command_value("system.file.split_size"),
-                            rpc::call_command_string("system.file.split_suffix"));
+  try {
+    if (rpc::call_command_value("system.file.split_size") >= 0)
+      torrent::file_split_all(download->download()->file_list(),
+                              rpc::call_command_value("system.file.split_size"),
+                              rpc::call_command_string("system.file.split_suffix"));
+  } catch (const torrent::input_error& e) {
+    std::string msg = "Could not split files: " + std::string(e.what());
+
+    lt_log_print(torrent::LOG_ERRORS, "%s: %s", msg.c_str(), m_uri.c_str());
+
+    torrent::download_remove(*download->download());
+    delete download;
+
+    return receive_failed(msg);
+  }
 
   if (rtorrent->has_key_string("directory")) {
     rpc::call_command("d.directory_base.set", rtorrent->get_key("directory"), rpc::make_target(download));
@@ -274,32 +332,44 @@ DownloadFactory::receive_success() {
 
   rpc::call_command("d.peer_exchange.set", torrent::runtime::client_config()->is_pex_enabled(), rpc::make_target(download));
 
-  torrent::resume_load_addresses(*download->download(), resumeObject);
-  torrent::resume_load_file_priorities(*download->download(), resumeObject);
-  torrent::resume_load_tracker_settings(*download->download(), resumeObject);
+  try {
+    torrent::resume_load_addresses(*download->download(), resumeObject);
+    torrent::resume_load_file_priorities(*download->download(), resumeObject);
+    torrent::resume_load_tracker_settings(*download->download(), resumeObject);
+
+  } catch (const torrent::input_error& e) {
+    std::string msg = std::string(session_invalid_message) + ": " + e.what();
+
+    lt_log_print(torrent::LOG_ERRORS, "%s: %s", msg.c_str(), m_uri.c_str());
+
+    if (m_printLog)
+      m_manager->push_log_std(msg + ": \"" + m_uri + "\"");
+
+    download->set_hash_failed(true);
+    download->set_message(msg);
+  }
 
   // The action of inserting might cause the torrent to be
   // opened/started or such. Figure out a nicer way of handling this.
   if (m_manager->download_list()->insert(download) == m_manager->download_list()->end()) {
-    // ATM doesn't really ever get here.
-    delete download;
+    // The list owns the download, also when an event handler erased it.
 
     m_slot_finished();
     return;
   }
 
-  // Save the info-hash just in case the commands decide to delete it.
-  torrent::HashString infohash = download->info()->hash();
+  // The commands may erase the download.
+  const auto lifetime = download->lifetime();
 
   try {
     if (torrent::log_groups[torrent::LOG_TORRENT_DEBUG].valid())
       log_created(download, rtorrent);
 
     for (const auto& command : m_commands)
-      rpc::parse_command_multiple_std(command, rpc::make_target(download));
-
-    if (m_manager->download_list()->find(infohash) == m_manager->download_list()->end())
-      throw torrent::input_error("The newly created download was removed.");
+      rpc::parse_command_multiple_std(command, rpc::make_target(download), [&lifetime]() {
+          if (lifetime.expired())
+            throw torrent::input_error("The newly created download was removed.");
+        });
 
     if (!m_session)
        rpc::call_command("d.state.set", (int64_t)m_start, rpc::make_target(download));
@@ -313,11 +383,10 @@ DownloadFactory::receive_success() {
     if (m_printLog)
       m_manager->push_log_std(msg);
 
-    if (m_manager->download_list()->find(infohash) != m_manager->download_list()->end()) {
+    if (!lifetime.expired()) {
       // Should stop it, mark it bad. Perhaps even delete it?
       download->set_hash_failed(true);
       download->set_message(msg);
-      //     m_manager->download_list()->erase(m_manager->download_list()->find(infohash.data()));
     }
   }
 

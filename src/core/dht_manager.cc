@@ -4,6 +4,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <torrent/exceptions.h>
 #include <torrent/object.h>
 #include <torrent/object_stream.h>
 #include <torrent/rate.h>
@@ -20,10 +21,10 @@
 #include "session/session_manager.h"
 
 #define LT_LOG(log_fmt, ...)                                            \
-  lt_log_print_subsystem(torrent::LOG_DHT_CONTROLLER, "dht_manager", log_fmt, __VA_ARGS__);
+  lt_log_print(torrent::LOG_DHT_CONTROLLER, "dht_manager : " log_fmt, __VA_ARGS__);
 
 #define LT_LOG_ERROR(log_fmt, ...)                                      \
-  lt_log_print_subsystem(torrent::LOG_DHT_ERROR, "dht_manager", log_fmt, __VA_ARGS__);
+  lt_log_print(torrent::LOG_DHT_ERROR, "dht_manager : " log_fmt, __VA_ARGS__);
 
 namespace core {
 
@@ -62,7 +63,14 @@ DhtManager::load_dht_cache() {
     LT_LOG("could not open cache file (path:%s)", cache_filename.c_str());
   }
 
-  torrent::runtime::network_manager()->dht_controller()->initialize(cache);
+  try {
+    torrent::runtime::network_manager()->dht_controller()->initialize(cache);
+
+  } catch (const torrent::base_error& e) {
+    LT_LOG_ERROR("cache file rejected, discarding (path:%s errmsg:%s)", cache_filename.c_str(), e.what());
+
+    torrent::runtime::network_manager()->dht_controller()->initialize(torrent::Object::create_map());
+  }
 
   if (m_start == dht_on)
     start_dht();
@@ -132,10 +140,11 @@ DhtManager::save_dht_cache() {
   torrent::Object cache = torrent::Object::create_map();
   cache_file << *torrent::runtime::network_manager()->dht_controller()->store_cache(&cache);
 
+  // The data only reaches the kernel here, so this is where a full disk is seen.
+  cache_file.close();
+
   if (!cache_file.good())
     return;
-
-  cache_file.close();
 
   ::rename(filename_tmp.c_str(), filename.c_str());
 }

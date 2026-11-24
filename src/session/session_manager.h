@@ -1,10 +1,13 @@
 #ifndef RTORRENT_SESSION_SESSION_MANAGER_H
 #define RTORRENT_SESSION_SESSION_MANAGER_H
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <future>
-#include <list>
+#include <map>
+#include <cstdint>
+#include <sys/types.h>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -13,6 +16,7 @@
 #include <torrent/common.h>
 
 class Control;
+class TestSessionManager;
 
 namespace core {
 class Download;
@@ -58,6 +62,10 @@ public:
   bool                use_lock() const;
   void                set_use_lock(bool use_lock);
 
+  int                 umask() const;
+  void                set_umask(int64_t umask);
+  mode_t              file_mode() const;
+
   void                save_full_download(core::Download* download);
   void                save_resume_download(core::Download* download);
   void                remove_download(core::Download* download);
@@ -65,6 +73,7 @@ public:
 protected:
   friend class ::Control;
   friend class ThreadSession;
+  friend class ::TestSessionManager;
 
   void                save_download(core::Download* download, bool skip_static);
 
@@ -72,6 +81,7 @@ protected:
   void                cleanup();
 
   void                flush_all_pending_builds();
+  void                flush_shutdown_saves();
 
 private:
   void                callback_pending_builds();
@@ -80,7 +90,7 @@ private:
 
   void                process_pending_builds(bool is_flushing);
   void                process_save_request();
-  void                process_next_save_request_unsafe();
+  bool                process_next_save_request_unsafe();
   void                process_finished_saves();
 
   // Requires a higher number of open sockets, and should only be used during shutdown.
@@ -89,7 +99,10 @@ private:
   bool                replace_save_request_unsafe(SaveRequest& download);
   bool                remove_completely_unsafe(core::Download* download, std::unique_lock<std::mutex>& lock);
 
-  using ProcessingSave = std::pair<std::future<void>, SaveRequest>;
+  using ProcessingSave = std::pair<std::future<int>, SaveRequest>;
+
+  void                consume_finished_save_unsafe(ProcessingSave& request);
+  void                report_storage_error_unsafe(const std::string& what);
 
   torrent::system::Thread*     m_thread;
   torrent::system::callback_id m_callback_id;
@@ -98,14 +111,19 @@ private:
   std::string                  m_path;
   bool                         m_use_fsyncdisk{true};
   bool                         m_use_lock{true};
+  int                          m_umask{};
 
-  align_cacheline std::mutex   m_mutex;
+  align_cacheline
 
-  bool                         m_active{};
+  std::atomic<bool>            m_active{};
+
+  align_cacheline
+
+  std::mutex                   m_mutex;
 
   std::deque<SaveRequest>      m_save_requests;
   std::atomic<size_t>          m_save_request_counter{};
-  std::list<ProcessingSave>    m_processing_saves;
+  std::map<std::string, ProcessingSave> m_processing_saves;
   std::atomic<size_t>          m_processing_save_counter{};
   std::condition_variable      m_finished_condition;
   std::vector<ProcessingSave>  m_finished_saves;
@@ -126,8 +144,9 @@ private:
 
 inline bool        SessionManager::is_used() const            { return !m_path.empty(); }
 inline std::string SessionManager::path() const               { return m_path; }
-inline bool        SessionManager::use_fsyncdisk() const      { return true; }
+inline bool        SessionManager::use_fsyncdisk() const      { return m_use_fsyncdisk; }
 inline bool        SessionManager::use_lock() const           { return m_use_lock; }
+inline int         SessionManager::umask() const              { return m_umask; }
 inline void        SessionManager::flush_all_pending_builds() { process_pending_builds(true); }
 
 } // namespace session

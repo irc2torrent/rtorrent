@@ -2,10 +2,10 @@
 #define RTORRENT_UI_DOWNLOAD_H
 
 #include <list>
+#include <memory>
 #include <torrent/peer/peer.h>
 
 #include "display/manager.h"
-#include "utils/list_focus.h"
 
 #include "element_base.h"
 
@@ -36,7 +36,7 @@ public:
     DISPLAY_MAX_SIZE
   } Display;
 
-  Download(core::Download* d);
+  Download(const std::shared_ptr<core::Download>& d);
   ~Download();
 
   void                activate(display::Frame* frame, bool focus = true);

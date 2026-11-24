@@ -19,6 +19,7 @@
 #include "rpc/tinyxml2/tinyxml2.h"
 #include "rpc/rpc_manager.h"
 #include "utils/base64.h"
+#include "utils/functional.h"
 #include "xmlrpc.h"
 
 namespace rpc {
@@ -49,13 +50,23 @@ element_access(const tinyxml2::XMLElement* elem, std::initializer_list<std::stri
   return result;
 }
 
+const char*
+element_text_value(const tinyxml2::XMLNode* node) {
+  auto text = node->ToText();
+
+  if (text == nullptr)
+    throw rpc_error(XMLRPC_TYPE_ERROR, "expected a text value");
+
+  return text->Value();
+}
+
 long long
 element_to_int(const tinyxml2::XMLNode* elem) {
   char* pos;
   if (elem->FirstChild() == nullptr) {
     throw rpc_error(XMLRPC_TYPE_ERROR, "unable to parse empty integer");
   }
-  auto str    = elem->FirstChild()->ToText()->Value();
+  auto str    = element_text_value(elem->FirstChild());
   auto result = std::strtoll(str, &pos, 10);
   if (pos == str || *pos != '\0')
     throw rpc_error(XMLRPC_TYPE_ERROR, "unable to parse integer value");
@@ -85,7 +96,7 @@ xml_value_to_object(const tinyxml2::XMLNode* elem) {
     if (child_element == nullptr)
       return torrent::Object("");
 
-    return torrent::Object(child_element->ToText()->Value());
+    return torrent::Object(element_text_value(child_element));
 
   } else if (std::strncmp(root_type, "int", sizeof("int")) == 0 ||
              std::strncmp(root_type, "i4", sizeof("i4")) == 0 ||
@@ -98,7 +109,7 @@ xml_value_to_object(const tinyxml2::XMLNode* elem) {
     if (child_element == nullptr)
       throw rpc_error(XMLRPC_TYPE_ERROR, "empty boolean element");
 
-    auto boolean_text = std::string(child_element->ToText()->Value());
+    auto boolean_text = std::string(element_text_value(child_element));
 
     if (boolean_text == "1")
       return torrent::Object((int64_t)1);
@@ -129,7 +140,12 @@ xml_value_to_object(const tinyxml2::XMLNode* elem) {
       if (name_element == nullptr)
         throw rpc_error(XMLRPC_PARSE_ERROR, "struct member missing name element");
 
-      map[name_element->GetText()] = std::move(xml_value_to_object(child->FirstChildElement("value")));
+      auto name_text = name_element->GetText();
+
+      if (name_text == nullptr)
+        throw rpc_error(XMLRPC_PARSE_ERROR, "struct member has an empty name element");
+
+      map[name_text] = std::move(xml_value_to_object(child->FirstChildElement("value")));
     }
 
     return map_raw;
@@ -140,7 +156,7 @@ xml_value_to_object(const tinyxml2::XMLNode* elem) {
     if (child_element == nullptr)
       return torrent::Object("");
 
-    return torrent::Object(utils::decode_base64(utils::remove_newlines(child_element->ToText()->Value())));
+    return torrent::Object(utils::decode_base64(utils::remove_newlines(element_text_value(child_element))));
 
   } else {
     throw rpc_error(XMLRPC_INTERNAL_ERROR, "received unsupported value type: " + std::string(root_type));
@@ -243,6 +259,8 @@ execute_command(std::string method_name, const tinyxml2::XMLElement* params_elem
   torrent::Object             params_raw = torrent::Object::create_list();
   torrent::Object::list_type& params     = params_raw.as_list();
   rpc::target_type            target     = rpc::make_target();
+  std::function<void()>       deleter    = []() {};
+  utils::scope_guard          guard([&deleter]() { deleter(); });
 
   if (params_element != nullptr) {
     if (std::strncmp(params_element->Name(), "params", sizeof("params")) == 0) {
@@ -250,8 +268,6 @@ execute_command(std::string method_name, const tinyxml2::XMLElement* params_elem
       const auto* child = params_element->FirstChildElement("param");
 
       if (child != nullptr) {
-        std::function<void()> deleter = []() {};
-
         RpcManager::object_to_target(xml_value_to_object(child->FirstChildElement("value")), cmd_itr->second.m_flags, &target, &deleter);
         child = child->NextSiblingElement("param");
 
@@ -267,8 +283,6 @@ execute_command(std::string method_name, const tinyxml2::XMLElement* params_elem
       const auto* child = params_element->FirstChildElement("data")->FirstChildElement("value");
 
       if (child != nullptr) {
-        std::function<void()> deleter = []() {};
-
         RpcManager::object_to_target(xml_value_to_object(child), cmd_itr->second.m_flags, &target, &deleter);
         child = child->NextSiblingElement("value");
 
@@ -300,6 +314,9 @@ process_document(const tinyxml2::XMLDocument* doc, tinyxml2::XMLPrinter* printer
   if (doc->FirstChildElement("methodCall")->FirstChildElement("methodName") == nullptr)
     throw rpc_error(XMLRPC_PARSE_ERROR, "methodName element not found");
   auto            method_name = doc->FirstChildElement("methodCall")->FirstChildElement("methodName")->GetText();
+
+  if (method_name == nullptr)
+    throw rpc_error(XMLRPC_PARSE_ERROR, "methodName element is empty");
   torrent::Object result;
 
   // Add a shim here for system.multicall to allow better code reuse, and
@@ -309,12 +326,20 @@ process_document(const tinyxml2::XMLDocument* doc, tinyxml2::XMLPrinter* printer
     auto& result_list     = result.as_list();
     auto  parent_elements = element_access(doc->RootElement(), {"params", "param", "value", "array", "data"});
     for (auto child = parent_elements->FirstChildElement("value"); child; child = child->NextSiblingElement("value")) {
-      auto sub_method_name = element_access(child, {"struct", "member", "value", "string"})->GetText();
+      auto method_name_member = element_access(child, {"struct", "member"});
+      auto member_name        = method_name_member->FirstChildElement("name");
+
+      if (member_name == nullptr || member_name->GetText() == nullptr ||
+          std::strncmp(member_name->GetText(), "methodName", sizeof("methodName")) != 0)
+        throw rpc_error(XMLRPC_PARSE_ERROR, "multicall struct's first member must be methodName");
+
+      auto sub_method_name = element_access(method_name_member, {"value", "string"})->GetText();
+
+      if (sub_method_name == nullptr)
+        throw rpc_error(XMLRPC_PARSE_ERROR, "multicall methodName element is empty");
       // If sub_params ends up a nullptr at the end of this if-chian,
       // execute_command will turn it into an empty list
-      auto sub_params = element_access(child, {"struct", "member"});
-      if (sub_params != nullptr)
-        sub_params = sub_params->NextSiblingElement("member");
+      auto sub_params = method_name_member->NextSiblingElement("member");
       if (sub_params != nullptr)
         sub_params = sub_params->FirstChildElement("value");
       if (sub_params != nullptr)
@@ -405,6 +430,14 @@ XmlRpc::process(const char* inBuffer, uint32_t length, slot_write slotWrite) {
     // remains.
     tinyxml2::XMLPrinter printer(nullptr, true, 0);
     process_document(&doc, &printer);
+
+    if (printer.CStrSize() - 1 > static_cast<int>(SCgiTask::max_response_size)) {
+      tinyxml2::XMLPrinter fault_printer(nullptr, true, 0);
+      print_xmlrpc_fault(XMLRPC_LIMIT_EXCEEDED_ERROR, "Response size exceeds maximum XML-RPC limit", &fault_printer);
+
+      return slotWrite(fault_printer.CStr(), fault_printer.CStrSize() - 1);
+    }
+
     return slotWrite(printer.CStr(), printer.CStrSize() - 1);
   } catch (rpc_error& e) {
     tinyxml2::XMLPrinter printer(nullptr, true, 0);

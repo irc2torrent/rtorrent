@@ -154,10 +154,10 @@ Manager::cleanup() {
 void
 Manager::shutdown(bool force) {
   if (!force) {
-    for (auto d : *m_download_list)
-      m_download_list->pause_default(d);
+    for (const auto& d : *m_download_list)
+      m_download_list->pause_default(d.get());
   } else {
-    for (auto d : *m_download_list)
+    for (const auto& d : *m_download_list)
       m_download_list->close_quick(d);
   }
 }
@@ -195,14 +195,14 @@ Manager::try_create_download(const std::string& uri, int flags, const command_li
     return;
 
   // Adding download.
-  DownloadFactory* f = new DownloadFactory(this);
+  auto f = std::make_unique<DownloadFactory>(this);
 
   f->variables()["tied_to_file"] = (int64_t)(bool)(flags & create_tied);
   f->commands().insert(f->commands().end(), commands.begin(), commands.end());
 
   f->set_start(flags & create_start);
   f->set_print_log(!(flags & create_quiet));
-  f->slot_finished([f]() { delete f; });
+  f->slot_finished([factory = f.get()]() { delete factory; });
 
   if (is_data_uri(uri)) {
     // Allow the use of data URIs, primarily for JSON-RPC which
@@ -216,10 +216,13 @@ Manager::try_create_download(const std::string& uri, int flags, const command_li
   }
 
   f->commit();
+
+  // From here the finished slot deletes it.
+  f.release();
 }
 
 void
-Manager::try_create_download_from_meta_download(torrent::Object* bencode, const std::string& metafile) {
+Manager::try_create_download_from_meta_download(std::unique_ptr<torrent::Object> bencode, const std::string& metafile) {
   DownloadFactory* f = new DownloadFactory(this);
 
   f->variables()["tied_to_file"] = (int64_t)true;
@@ -385,6 +388,8 @@ Manager::try_create_download_expand(const std::string& uri, int flags, command_l
 // hashing view and starts hashing if nessesary.
 void
 Manager::receive_hashing_changed() {
+  constexpr auto hashing_failed_message = "Hashing failed: ";
+
   bool foundHashing = std::any_of(m_hashingView->begin_visible(), m_hashingView->end_visible(),
                                    std::mem_fn(&Download::is_hash_checking));
 
@@ -405,7 +410,11 @@ Manager::receive_hashing_changed() {
       continue;
 
     try {
-      m_download_list->open_throw(*itr);
+      m_download_list->open_throw(itr->get());
+
+      // An open that works retires the failure an earlier pass reported.
+      if ((*itr)->message().compare(0, std::strlen(hashing_failed_message), hashing_failed_message) == 0)
+        (*itr)->set_message("");
 
       // Since the bitfield is allocated on loading of resume load or
       // hash start, and unallocated on close, we know that if it it
@@ -433,11 +442,13 @@ Manager::receive_hashing_changed() {
       if (tryQuick) {
         // Make sure we don't repeat the quick hashing.
         rpc::call_command_set_value("d.hashing.set", Download::variable_hashing_rehash, rpc::make_target(*itr));
+      }
 
-      } else {
+      if (!tryQuick || !foundHashing) {
         (*itr)->set_hash_failed(true);
-        (*itr)->set_message("Hashing failed: " + std::string(e.what()));
-        lt_log_print(torrent::LOG_TORRENT_ERROR, "Hashing failed: %s", e.what());
+        (*itr)->set_message(hashing_failed_message + std::string(e.what()));
+
+        lt_log_print_hash(torrent::LOG_TORRENT_EVENTS, (*itr)->info()->hash(), "hashing failed : %s", e.what());
       }
     }
   }

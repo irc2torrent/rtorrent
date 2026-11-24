@@ -14,6 +14,7 @@
 #include <torrent/runtime/socket_manager.h>
 #include <torrent/system/callbacks.h>
 #include <torrent/system/poll.h>
+#include <torrent/system/scheduler.h>
 #include <torrent/utils/log.h>
 
 #include "control.h"
@@ -27,7 +28,7 @@ namespace rpc {
 SCgiTask::SCgiTask()
   : m_callback_id(torrent::system::make_callback_id()) {
 
-  reset_file_descriptor();
+  m_task_timeout.slot() = [this]() { close(); };
 }
 
 void
@@ -50,6 +51,8 @@ SCgiTask::open(SCgi* parent, int fd) {
   torrent::this_thread::poll()->open(this);
   torrent::this_thread::poll()->insert_read(this);
 
+  torrent::this_thread::scheduler()->update_wait_for_ceil_seconds(&m_task_timeout, timeout_request);
+
   auto lock = std::lock_guard<std::mutex>(m_result_mutex);
 
   // Leave room for terminating nul byte for parsing the header.
@@ -61,10 +64,10 @@ SCgiTask::cancel_open() {
   if (!is_open())
     return;
 
+  torrent::this_thread::scheduler()->erase(&m_task_timeout);
   torrent::this_thread::poll()->remove_and_close(this);
 
-  torrent::fd_close(file_descriptor());
-  reset_file_descriptor();
+  torrent::fd_close_and_clear(file_descriptor_ref());
 };
 
 void
@@ -72,19 +75,20 @@ SCgiTask::close() {
   if (!is_open())
     return;
 
+  torrent::this_thread::scheduler()->erase(&m_task_timeout);
+
   torrent::system::cancel_callback_and_wait(m_callback_id, scgi_thread::thread(), torrent::main_thread::thread());
 
   torrent::runtime::socket_manager()->close_event_or_throw(this, [this]() {
       torrent::this_thread::poll()->remove_and_close(this);
-
-      torrent::fd_close(file_descriptor());
-      reset_file_descriptor();
+      torrent::fd_close_and_clear(file_descriptor_ref());
     });
 
   // The callbacks are guaranteed to be finished/canceled at this point.
   auto lock = std::lock_guard<std::mutex>(m_result_mutex);
 
-  m_buffer.clear();
+  // clear() would keep the capacity, and the task is pooled for the lifetime of the process.
+  std::vector<char>().swap(m_buffer);
 }
 
 void
@@ -94,8 +98,12 @@ SCgiTask::event_read() {
   if (m_content_length == 0)
     read_length--;
 
-  if (read_length <= 0)
+  if (read_length <= 0) {
+    if (m_content_length == 0)
+      return close();
+
     throw torrent::internal_error("SCgiTask::event_read() no space in buffer for event_read.");
+  }
 
   int bytes = ::recv(file_descriptor(), m_buffer.data() + m_position, read_length, 0);
 
@@ -153,6 +161,8 @@ SCgiTask::event_read() {
     return;
 
   torrent::this_thread::poll()->remove_read(this);
+
+  torrent::this_thread::scheduler()->update_wait_for_ceil_seconds(&m_task_timeout, timeout_request);
 
   if (m_parent->log_fd() >= 0) {
     [[maybe_unused]] int result;
@@ -389,7 +399,7 @@ void
 SCgiTask::receive_write(const char* buffer, uint32_t length) {
   assert(torrent::this_thread::thread() == torrent::main_thread::thread());
 
-  if (buffer == nullptr || length > (100 << 20))
+  if (buffer == nullptr || length > max_response_size)
     throw torrent::internal_error("SCgiTask::receive_write(...) received bad input.");
 
   // Main thread callback already locked this mutex.

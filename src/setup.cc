@@ -37,7 +37,7 @@ parse_main_options(int argc, char** argv) {
 
     optionParser.insert_option('b', [](auto& arg) { rpc::call_command_set_string("network.bind_address.set", arg); });
     optionParser.insert_option('d', [](auto& arg) { rpc::call_command_set_string("directory.default.set", arg); });
-    optionParser.insert_option('i', [](auto& arg) { rpc::call_command_set_string("ip", arg); });
+    optionParser.insert_option('i', [](auto& arg) { rpc::call_command_set_string("network.local_address.set", arg); });
     optionParser.insert_option('p', [](auto& arg) { rpc::call_command_set_string("network.listen.port.range.set", arg); });
     optionParser.insert_option('s', [](auto& arg) { rpc::call_command_set_string("session", arg); });
 
@@ -86,9 +86,13 @@ config_comment_log(const std::string& command, const std::string& raw_args) {
     pos = next_pos + 1;
   }
 
-  if (command == "log.add_output")
+  if (command == "log.add_output") {
+    if (args.size() != 2)
+      throw torrent::input_error("Invalid number of arguments.");
+
     log_add_group_output_str(args[0], args[1]);
-  else if (command == "log.open_file")
+
+  } else if (command == "log.open_file")
     apply_log_open_str(0, args);
   else if (command == "log.open_file.flush")
     apply_log_open_str(log_flag_flush, args);
@@ -138,7 +142,7 @@ parse_config_file_comments(const std::string& path) {
     else
       throw torrent::input_error("Unknown command in config file comment: " + line);
 
-    lt_log_print(torrent::LOG_NOTICE, "Pre-config command: %s=%s", command.c_str(), args.c_str());
+    lt_log_print(torrent::LOG_EVENTS, "Pre-config command: %s=%s", command.c_str(), args.c_str());
   }
 }
 

@@ -2,8 +2,10 @@
 
 #include "rpc/jsonrpc.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <torrent/common.h>
 #include <torrent/torrent.h>
 #include <torrent/utils/string_manip.h>
@@ -13,6 +15,7 @@
 #include "rpc/command_map.h"
 #include "rpc/nlohmann/json.h"
 #include "rpc/parse_commands.h"
+#include "rpc/scgi_task.h"
 #include "torrent/exceptions.h"
 #include "torrent/object.h"
 #include "utils/functional.h"
@@ -26,10 +29,12 @@ constexpr int JSONRPC_METHOD_NOT_FOUND_ERROR = -32601;
 constexpr int JSONRPC_INVALID_PARAMS_ERROR   = -32602;
 constexpr int JSONRPC_INTERNAL_ERROR         = -32000;
 
+constexpr uint32_t max_json_depth = 1024;
+
 using json = nlohmann::json;
 
 torrent::Object
-json_to_object(const json& value) {
+json_to_object(const json& value, uint32_t depth = 0) {
   switch (value.type()) {
   case json::value_t::number_unsigned:
   case json::value_t::number_integer:
@@ -42,20 +47,26 @@ json_to_object(const json& value) {
     return torrent::Object(value.get<std::string>());
 
   case json::value_t::array: {
+    if (++depth >= max_json_depth)
+      throw torrent::input_error("invalid parameters: max depth reached");
+
     auto  array_raw = torrent::Object::create_list();
     auto& array     = array_raw.as_list();
 
     for (const auto& entry : value)
-      array.push_back(json_to_object(entry));
+      array.push_back(json_to_object(entry, depth));
 
     return array_raw;
   }
   case json::value_t::object: {
+    if (++depth >= max_json_depth)
+      throw torrent::input_error("invalid parameters: max depth reached");
+
     auto  map_raw = torrent::Object::create_map();
     auto& map     = map_raw.as_map();
 
     for (const auto& entry : value.items())
-      map[entry.key()] = json_to_object(entry.value());
+      map[entry.key()] = json_to_object(entry.value(), depth);
 
     return map_raw;
   }
@@ -138,7 +149,7 @@ jsonrpc_call_command(const std::string& method, const json& params) {
 
   CommandMap::iterator itr = commands.find(method.c_str());
 
-  if (itr == commands.end()) {
+  if (itr == commands.end() || !(itr->second.m_flags & CommandMap::flag_public_rpc)) {
     throw rpc_error(JSONRPC_METHOD_NOT_FOUND_ERROR, "method not found: " + method);
   }
 
@@ -214,13 +225,49 @@ handle_notification(const json& request) noexcept {
   }
 }
 
+namespace {
+
+using json_input_adapter = decltype(nlohmann::detail::input_adapter(std::declval<const char*>(), std::declval<const char*>()));
+using json_dom_parser    = nlohmann::detail::json_sax_dom_parser<json, json_input_adapter>;
+
+class json_depth_limited_parser : public json_dom_parser {
+public:
+  explicit json_depth_limited_parser(json& root) : json_dom_parser(root) {}
+
+  bool start_object(std::size_t length) { return enter() && json_dom_parser::start_object(length); }
+  bool start_array(std::size_t length) { return enter() && json_dom_parser::start_array(length); }
+
+  bool end_object() { m_depth--; return json_dom_parser::end_object(); }
+  bool end_array() { m_depth--; return json_dom_parser::end_array(); }
+
+private:
+  bool enter() { return ++m_depth <= max_json_depth; }
+
+  uint32_t m_depth{0};
+};
+
+} // namespace
+
 bool
 JsonRpc::process(const char* in_buffer, uint32_t length, slot_write callback) {
   json response;
   json body;
 
+  if (length > m_size_limit) {
+    auto err_str = json_error(JSONRPC_INVALID_REQUEST_ERROR, "content size exceeds maximum RPC limit", nullptr).dump();
+
+    return callback(err_str.c_str(), err_str.size());
+  }
+
   try {
-    body = json::parse(in_buffer, in_buffer + length);
+    json_depth_limited_parser handler(body);
+
+    if (!json::sax_parse(in_buffer, in_buffer + length, &handler)) {
+      auto err_str = json_error(JSONRPC_INVALID_REQUEST_ERROR, "maximum nesting depth exceeded", nullptr).dump();
+
+      return callback(err_str.c_str(), err_str.size());
+    }
+
     switch (body.type()) {
     case json::value_t::object: {
       if (!body.contains("id")) {
@@ -256,13 +303,17 @@ JsonRpc::process(const char* in_buffer, uint32_t length, slot_write callback) {
 
     std::string response_str = response.dump();
 
+    if (response_str.size() > SCgiTask::max_response_size) {
+      const auto& id = response.is_object() && response.contains("id") ? response["id"] : json(nullptr);
+      auto err_str = json_error(JSONRPC_INTERNAL_ERROR, "response size exceeds maximum RPC limit", id).dump();
+
+      return callback(err_str.c_str(), err_str.size());
+    }
+
     return callback(response_str.c_str(), response_str.size());
 
-  } catch (json::parse_error& e) {
-    auto err_str = json_error(JSONRPC_PARSE_ERROR, e.what(), nullptr).dump(-1, ' ', false, json::error_handler_t::replace);
-    return callback(err_str.c_str(), err_str.size());
-  } catch (json::type_error& e) {
-    // Type errors may be caused by invalid UTF-8 strings in exception strings, hence the ::replace
+  } catch (json::exception& e) {
+    // Exception strings may contain invalid UTF-8, hence the ::replace
     auto err_str = json_error(JSONRPC_PARSE_ERROR, e.what(), nullptr).dump(-1, ' ', false, json::error_handler_t::replace);
     return callback(err_str.c_str(), err_str.size());
   }
