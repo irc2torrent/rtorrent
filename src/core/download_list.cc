@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <string_view>
+#include <vector>
 #include <torrent/data/file.h>
 #include <torrent/utils/resume.h>
 #include <torrent/exceptions.h>
@@ -53,22 +54,26 @@ DownloadList::check_contains([[maybe_unused]] Download* d) {
 
 void
 DownloadList::clear() {
-  int error_count = 0;
+  m_clearing = true;
+  utils::scope_guard guard([this]() { m_clearing = false; });
 
-  while (!empty()) {
-    auto download = back();
+  int  error_count = 0;
+  auto downloads   = std::vector<std::shared_ptr<Download>>(begin(), end());
 
+  for (auto itr = downloads.rbegin(); itr != downloads.rend(); ++itr) {
     try {
-      close(download);
-      base_type::pop_back();
-
-      torrent::download_remove(*download->download());
+      close(*itr);
 
     } catch (torrent::internal_error& e) {
-      lt_log_print(torrent::LOG_ERRORS, "DownloadList::clear() failed to close or remove download: %s", e.what());
+      lt_log_print(torrent::LOG_ERRORS, "DownloadList::clear() failed to close download: %s", e.what());
       error_count++;
-      continue;
     }
+  }
+
+  while (!empty()) {
+    auto download = base_type::pop_back();
+
+    torrent::download_remove(*download->download());
   }
 
   if (error_count > 0)
@@ -135,11 +140,11 @@ DownloadList::find_hex_ptr(const char* hash) {
 }
 
 Download*
-DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) {
+DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog, bool is_session) {
   torrent::Download download;
 
   try {
-    download = torrent::download_add(obj, tracker_key);
+    download = is_session ? torrent::download_add_session(obj, tracker_key) : torrent::download_add(obj, tracker_key);
 
   } catch (torrent::local_error& e) {
     if (printLog)
@@ -156,7 +161,7 @@ DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) 
 }
 
 Download*
-DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
+DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog, bool is_session) {
   torrent::Object* object = new torrent::Object;
   torrent::Download download;
 
@@ -174,7 +179,7 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
       return NULL;
     }
 
-    download = torrent::download_add(object, tracker_key);
+    download = is_session ? torrent::download_add_session(object, tracker_key) : torrent::download_add(object, tracker_key);
 
   } catch (torrent::local_error& e) {
     delete object;
@@ -251,6 +256,9 @@ DownloadList::iterator
 DownloadList::erase(iterator itr) {
   View::check_unlocked();
 
+  if (m_clearing)
+    throw torrent::input_error("Cannot erase a download while the download list is being cleared.");
+
   if (itr == end())
     throw torrent::internal_error("DownloadList::erase(...) could not find download.");
 
@@ -303,6 +311,7 @@ DownloadList::open(Download* download) {
 
 void
 DownloadList::open_throw(Download* download) {
+  View::check_unlocked();
   check_contains(download);
 
   lt_log_print_hash(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : opening download");
@@ -334,6 +343,8 @@ DownloadList::close(Download* download) {
 // need the files closed and will keep using the download.
 void
 DownloadList::close_files(Download* download) {
+  View::check_unlocked();
+
   lt_log_print_hash(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download files");
 
   if (download->download()->info()->is_active()) {
@@ -361,6 +372,9 @@ DownloadList::close_directly(Download* download) {
   close_files(download);
   set_state_stopped(download);
 
+  if (lifetime.expired())
+    return;
+
   if (was_active) {
     DL_TRIGGER_EVENT(download, "event.download.paused");
 
@@ -382,7 +396,13 @@ DownloadList::close_directly(Download* download) {
 
 void
 DownloadList::set_state_stopped(Download* download) {
+  auto lifetime = download->lifetime();
+
   control->view_manager()->find_ptr_throw("stopped")->set_visible(download);
+
+  if (lifetime.expired())
+    return;
+
   rpc::call_command("d.state.set", (int64_t)0, rpc::make_target(download));
 }
 
@@ -401,7 +421,12 @@ void
 DownloadList::close_quick(Download* download) {
   lt_log_print_hash(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download quickly.");
 
+  auto lifetime = download->lifetime();
+
   close(download);
+
+  if (lifetime.expired())
+    return;
 
   // Make sure we cancel any tracker requests. This should rather be
   // handled by some parameter to the close function, or some other
@@ -453,10 +478,31 @@ DownloadList::close_throw(Download* download) {
 }
 
 void
+DownloadList::close_keep_hash_queue(Download* download) {
+  if (!download->is_hash_checking() && !download->is_hash_failed() &&
+      rpc::call_command_value("d.state", rpc::make_target(download)) == 1 &&
+      rpc::call_command_value("d.hashing", rpc::make_target(download)) != Download::variable_hashing_stopped) {
+    bool was_open = download->is_open();
+
+    close_files(download);
+
+    if (was_open)
+      DL_TRIGGER_EVENT(download, "event.download.closed");
+
+    return;
+  }
+
+  close_throw(download);
+}
+
+void
 DownloadList::resume(Download* download, int flags) {
   // Refuse before the catch below hides the refusal of the view change.
   View::check_unlocked();
   check_contains(download);
+
+  if (download->is_hash_failed())
+    return;
 
   // A removal hook that resumes again would repeat the failed start without end.
   if (resume_failure_reporting)
@@ -466,12 +512,17 @@ DownloadList::resume(Download* download, int flags) {
 
   constexpr auto resume_failed_message = "Could not resume download: ";
 
+  auto           lifetime = download->lifetime();
+
   try {
 
     if (download->download()->info()->is_active())
       return;
 
     rpc::parse_command_single(rpc::make_target(download), "view.set_visible=active");
+
+    if (lifetime.expired())
+      return;
 
     // We need to make sure the flags aren't reset if someone decideds
     // to call resume() while it is hashing, etc.
@@ -484,11 +535,6 @@ DownloadList::resume(Download* download, int flags) {
     // It is also assumed the is_hash_checked flag gets cleared when
     // 'hashing' was set.
     if (!download->is_hash_checked()) {
-      // If the hash failed flag wasn't cleared then hashing won't be
-      // initiated.
-      if (download->is_hash_failed())
-        return;
-
       if (rpc::call_command_value("d.hashing", rpc::make_target(download)) == Download::variable_hashing_stopped)
         rpc::call_command("d.hashing.set", Download::variable_hashing_initial, rpc::make_target(download));
 
@@ -557,6 +603,11 @@ DownloadList::resume(Download* download, int flags) {
     DL_TRIGGER_EVENT(download, "event.download.resumed");
 
   } catch (torrent::local_error& e) {
+    if (lifetime.expired()) {
+      lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not resume download : %s", e.what());
+      return;
+    }
+
     LT_LOG_DOWNLOAD_EVENTS("could not resume download : %s", e.what());
 
     // The download did not start: report why and give up its slot in the 'active' view,
@@ -585,6 +636,9 @@ DownloadList::pause(Download* download, int flags) {
     download->set_resume_flags(Download::default_resume_flags);
 
     rpc::parse_command_single(rpc::make_target(download), "view.set_not_visible=active");
+
+    if (lifetime.expired())
+      return;
 
     // Always clear hashing on pause. When a hashing request is added,
     // it should have cleared the hash resume data.
@@ -619,6 +673,11 @@ DownloadList::pause(Download* download, int flags) {
     //control->core()->download_store()->save(download);
 
   } catch (torrent::local_error& e) {
+    if (lifetime.expired()) {
+      lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not pause download : %s", e.what());
+      return;
+    }
+
     LT_LOG_DOWNLOAD_EVENTS("could not pause download : %s", e.what());
   }
 }
@@ -631,6 +690,8 @@ DownloadList::check_hash(Download* download) {
 
   LT_LOG_DOWNLOAD_DEBUG("checking hash", 0);
 
+  auto lifetime = download->lifetime();
+
   try {
     if (rpc::call_command_value("d.hashing", rpc::make_target(download)) != Download::variable_hashing_stopped)
       return;
@@ -638,6 +699,11 @@ DownloadList::check_hash(Download* download) {
     hash_queue(download, Download::variable_hashing_rehash);
 
   } catch (torrent::local_error& e) {
+    if (lifetime.expired()) {
+      lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not check hash : %s", e.what());
+      return;
+    }
+
     LT_LOG_DOWNLOAD_EVENTS("could not check hash : %s", e.what());
   }
 }
@@ -657,6 +723,13 @@ DownloadList::hash_done(Download* download) {
     auto& msg = download->download()->hash_error_message();
     if (!msg.empty())
       download->set_message(msg);
+
+    auto lifetime = download->lifetime();
+
+    control->view_manager()->find_ptr_throw("active")->set_not_visible(download);
+
+    if (lifetime.expired())
+      return;
 
     DL_TRIGGER_EVENT(download, "event.download.hash_failed");
     return;
@@ -702,7 +775,13 @@ DownloadList::hash_done(Download* download) {
     // If the download was previously completed but the files were
     // f.ex deleted, then we clear the state and complete.
     if (rpc::call_command_value("d.complete", rpc::make_target(download)) && !download->is_done()) {
+      auto lifetime = download->lifetime();
+
       set_state_stopped(download);
+
+      if (lifetime.expired())
+        return;
+
       download->set_message(completed_unfinished_message);
     }
 
@@ -886,8 +965,17 @@ void
 DownloadList::process_meta_download(Download* download) {
   LT_LOG_DOWNLOAD_DEBUG("processing meta download", 0);
 
+  auto lifetime = download->lifetime();
+
   rpc::call_command("d.stop", torrent::Object(), rpc::make_target(download));
+
+  if (lifetime.expired())
+    return;
+
   rpc::call_command("d.close", torrent::Object(), rpc::make_target(download));
+
+  if (lifetime.expired())
+    return;
 
   std::string  metafile = (*download->file_list()->begin())->frozen_path().str();
 

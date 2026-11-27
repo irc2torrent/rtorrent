@@ -53,6 +53,8 @@ rtorrent_Test_Rpc_SOURCES = $(rtorrent_Test_Common) \
 	rpc/test_object_storage.h \
 	rpc/test_parse.cc \
 	rpc/test_parse.h \
+	rpc/test_parse_commands.cc \
+	rpc/test_parse_commands.h \
 	rpc/test_parse_options.cc \
 	rpc/test_parse_options.h \
 	rpc/test_rpc_manager.cc \
@@ -73,6 +75,8 @@ rtorrent_Test_Src_SOURCES = $(rtorrent_Test_Common) \
 	src/test_command_system.h \
 	src/test_command_path.cc \
 	src/test_command_path.h \
+	src/test_command_scheduler.cc \
+	src/test_command_scheduler.h \
 	src/test_command_string.cc \
 	src/test_command_string.h \
 	src/test_command_throttle.cc \

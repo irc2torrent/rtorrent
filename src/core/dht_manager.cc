@@ -4,6 +4,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
 #include <torrent/exceptions.h>
 #include <torrent/object.h>
 #include <torrent/object_stream.h>
@@ -136,6 +137,12 @@ DhtManager::save_dht_cache() {
 
   if (!cache_file.is_open())
     return;
+
+  auto file_mode = session_thread::manager()->file_mode();
+  if (file_mode != 0 && ::chmod(filename_tmp.c_str(), file_mode) == -1) {
+    LT_LOG_ERROR("could not set cache file permissions (path:%s)", filename_tmp.c_str());
+    return;
+  }
 
   torrent::Object cache = torrent::Object::create_map();
   cache_file << *torrent::runtime::network_manager()->dht_controller()->store_cache(&cache);
@@ -320,6 +327,17 @@ DhtManager::dht_statistics() {
     dhtStats.insert_key("peers",            stats.num_peers);
     dhtStats.insert_key("peers_max",        stats.max_peers);
     dhtStats.insert_key("torrents",         stats.num_trackers);
+
+    // The IPv6 DHT (BEP 32, libtorrent-dht-ipv6.patch): its own table beside the IPv4 one.
+    dhtStats.insert_key("active6",           stats.active6);
+    dhtStats.insert_key("cycle6",            stats.cycle6);
+    dhtStats.insert_key("queries_received6", stats.queries_received6);
+    dhtStats.insert_key("queries_sent6",     stats.queries_sent6);
+    dhtStats.insert_key("replies_received6", stats.replies_received6);
+    dhtStats.insert_key("nodes6",            stats.num_nodes6);
+    dhtStats.insert_key("buckets6",          stats.num_buckets6);
+    dhtStats.insert_key("peers6",            stats.num_peers6);
+    dhtStats.insert_key("torrents6",         stats.num_trackers6);
   }
 
   return dhtStats;

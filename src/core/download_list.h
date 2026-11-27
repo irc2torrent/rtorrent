@@ -61,8 +61,8 @@ public:
   Download*           find_hex_ptr(const char* hash);
 
   // Might move this to DownloadFactory.
-  Download*           create(std::istream* str, uint32_t tracker_key, bool printLog);
-  Download*           create(torrent::Object* obj, uint32_t tracker_key, bool printLog);
+  Download*           create(std::istream* str, uint32_t tracker_key, bool printLog, bool is_session);
+  Download*           create(torrent::Object* obj, uint32_t tracker_key, bool printLog, bool is_session);
 
   iterator            insert(Download* d);
 
@@ -87,6 +87,7 @@ public:
   void                close_files(Download* d);
   void                close_quick(Download* d);
   void                close_throw(Download* d);
+  void                close_keep_hash_queue(Download* d);
 
   void                resume(Download* d, int flags = 0);
   void                pause(Download* d, int flags = 0);
@@ -151,6 +152,8 @@ private:
   void                confirm_finished(Download* d);
 
   void                process_meta_download(Download* d);
+
+  bool                m_clearing{};
 };
 
 }

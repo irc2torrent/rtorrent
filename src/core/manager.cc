@@ -18,6 +18,7 @@
 #include <torrent/net/socket_address.h>
 #include <torrent/runtime/network_config.h>
 #include <torrent/runtime/network_manager.h>
+#include <torrent/system/thread.h>
 #include <torrent/utils/log.h>
 #include <torrent/utils/string_manip.h>
 
@@ -41,6 +42,7 @@ const int Manager::create_start;
 const int Manager::create_tied;
 const int Manager::create_quiet;
 const int Manager::create_raw_data;
+const int Manager::create_edited;
 
 void
 Manager::push_log(const char* msg) {
@@ -153,12 +155,25 @@ Manager::cleanup() {
 
 void
 Manager::shutdown(bool force) {
-  if (!force) {
-    for (const auto& d : *m_download_list)
-      m_download_list->pause_default(d.get());
-  } else {
-    for (const auto& d : *m_download_list)
-      m_download_list->close_quick(d);
+  auto                prev = m_download_list->end();
+  std::weak_ptr<void> prev_lifetime;
+
+  for (auto itr = m_download_list->begin(); itr != m_download_list->end();) {
+    auto lifetime = (*itr)->lifetime();
+
+    if (!force)
+      m_download_list->pause_default(itr->get());
+    else
+      m_download_list->close_quick(*itr);
+
+    if (!lifetime.expired()) {
+      prev          = itr++;
+      prev_lifetime = lifetime;
+    } else if (!prev_lifetime.expired()) {
+      itr = std::next(prev);
+    } else {
+      itr = m_download_list->begin();
+    }
   }
 }
 
@@ -201,6 +216,7 @@ Manager::try_create_download(const std::string& uri, int flags, const command_li
   f->commands().insert(f->commands().end(), commands.begin(), commands.end());
 
   f->set_start(flags & create_start);
+  f->set_edited(flags & create_edited);
   f->set_print_log(!(flags & create_quiet));
   f->slot_finished([factory = f.get()]() { delete factory; });
 
@@ -395,7 +411,17 @@ Manager::receive_hashing_changed() {
 
   // Try quick hashing all those with hashing == initial, set them to
   // something else when failed.
-  for (View::iterator itr = m_hashingView->begin_visible(), last = m_hashingView->end_visible(); itr != last; ++itr) {
+  auto downloads = std::vector<std::shared_ptr<Download>>(m_hashingView->begin_visible(), m_hashingView->end_visible());
+
+  for (auto itr = downloads.begin(); itr != downloads.end(); ++itr) {
+    auto download = itr->get();
+    auto lifetime = download->lifetime();
+
+    torrent::this_thread::thread()->process_interrupt_callbacks();
+
+    if (lifetime.expired())
+      continue;
+
     if ((*itr)->is_hash_checked())
       throw torrent::internal_error("core::Manager::receive_hashing_changed() (*itr)->is_hash_checked().");
 
@@ -409,8 +435,19 @@ Manager::receive_hashing_changed() {
     if (!tryQuick && foundHashing)
       continue;
 
+    auto size    = m_hashingView->size_visible();
+    auto changed = [&]() {
+      return lifetime.expired() || m_hashingView->size_visible() != size || std::find(m_hashingView->begin_visible(), m_hashingView->end_visible(), *itr) == m_hashingView->end_visible();
+    };
+
+    if (changed())
+      continue;
+
     try {
-      m_download_list->open_throw(itr->get());
+      m_download_list->open_throw(download);
+
+      if (changed())
+        return;
 
       // An open that works retires the failure an earlier pass reported.
       if ((*itr)->message().compare(0, std::strlen(hashing_failed_message), hashing_failed_message) == 0)
@@ -439,6 +476,11 @@ Manager::receive_hashing_changed() {
       foundHashing = true;
 
     } catch (torrent::local_error& e) {
+      if (changed()) {
+        lt_log_print(torrent::LOG_TORRENT_EVENTS, "hashing failed : %s", e.what());
+        return;
+      }
+
       if (tryQuick) {
         // Make sure we don't repeat the quick hashing.
         rpc::call_command_set_value("d.hashing.set", Download::variable_hashing_rehash, rpc::make_target(*itr));
